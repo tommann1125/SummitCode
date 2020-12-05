@@ -4,3 +4,165 @@ import sched, time
 import matplotlib.pyplot as plt
 from alpha_vantage.timeseries import TimeSeries
 import mplfinance as mpf
+
+
+interval=15
+start_date='2020-11-27'
+trade_volume=773.75
+asset='USDJPY'
+
+api_key='KWFDZZ908C59WMLB'
+ts = TimeSeries(key=api_key, output_format='pandas')
+data, meta_data = ts.get_intraday(symbol=asset,interval=str(interval)+'min',outputsize='full')
+data=data.rename(columns={'1. open':'open','2. high':'high','3. low':'low','4. close':'close','5. volume':'volume'})
+data
+
+
+data.index
+data.index = pd.to_datetime(data.index, format="%Y%m")
+data.index
+data=data.iloc[::-1]
+
+
+N=21
+data['lower_band'] = data['close'].rolling(window=N).mean() - 1.96*data['close'].rolling(window=N).std()
+data['upper_band'] = data['close'].rolling(window=N).mean() + 1.96*data['close'].rolling(window=N).std()
+data['percentB']=(data['close']-data['lower_band'])/(data['upper_band']-data['lower_band'])
+data
+
+
+data_graph=data[start_date:]
+
+def MAV(price,n):
+    return price.rolling(window=n).mean()
+
+mav1 = MAV(data_graph['close'],5)
+mav2 = MAV(data_graph['close'],21)
+mav_diff=(mav1-mav2)/mav1
+bands = data_graph[['lower_band','upper_band']]
+
+moving_avgs = [mpf.make_addplot(mav1,color='blue'),
+               mpf.make_addplot(bands,color='orange',linestyle='dashdot'),
+               mpf.make_addplot(mav2,color='skyblue'),
+               mpf.make_addplot(mav_diff,panel=1,type='bar',color='g', width=0.75)]
+
+mpf.plot(data_graph,addplot=moving_avgs,type='candle',figsize=(10,6),title=str(asset)+str(interval)+'min',style='yahoo')
+
+
+returns=data['close'].pct_change()
+returns=returns.dropna()
+daily_volatility=returns.std()*np.sqrt(1440/interval)
+print(str(asset)+' Daily volatility (%):' ,daily_volatility*100)
+daily_returns=(1+returns).prod()**(1440/len(returns)) -1
+print(str(asset)+' Daily returns (%):' ,daily_returns*100)
+
+def semideviation(r):
+    negative=r<0
+    return r[negative].std()
+daily_semideviation=semideviation(returns)*np.sqrt(1440/interval)
+print(str(asset)+' Daily semideviation (%)' ,daily_semideviation*100)
+
+print(str(asset)+' semideviation to volatility ratio (%)' ,round(daily_semideviation/daily_volatility,3) *100)
+
+def skewness(r):
+    "Skewness of data"
+    deviation_r=r-r.mean()
+    sigma_r=r.std(ddof=0)
+    exp=(deviation_r**3).mean()
+    return exp/sigma_r**3
+    
+print('returns data skewness:' ,skewness(returns))
+
+def kurtosis(r):
+    "Kurtosis of data"
+    deviation_r=r-r.mean()
+    sigma_r=r.std(ddof=0)
+    exp=(deviation_r**4).mean()
+    return exp/sigma_r**4
+
+from scipy.stats import norm
+def var_gaussian(r, level=5, modified=True):
+    """
+    Returns the Parametric Gauusian VaR of a Series or DataFrame
+    If "modified" is True, then the modified VaR is returned,
+    using the Cornish-Fisher modification
+    """
+    # compute the Z score assuming it was Gaussian
+    z = norm.ppf(level/100)
+    if modified:
+        # modify the Z score based on observed skewness and kurtosis
+        s = skewness(r)
+        k = kurtosis(r)
+        z = (z +
+                (z**2 - 1)*s/6 +
+                (z**3 -3*z)*(k-3)/24 -
+                (2*z**3 - 5*z)*(s**2)/36
+            )
+
+    return -(r.mean() + z*r.std(ddof=0))
+print(str(asset)+' Weekly Value at Risk is:' ,var_gaussian(returns))
+
+
+stop_loss=trade_volume*np.array([var_gaussian(returns)])
+print('USD/JPY stop loss value: ',stop_loss)
+
+
+def computeRSI (data, time_window):
+    diff = data.diff(1)       # diff in one field(one day)
+
+    #this preservers dimensions off diff values
+    up_chg = 0 * diff
+    down_chg = 0 * diff
+    
+    # up change is equal to the positive difference, otherwise equal to zero
+    up_chg[diff > 0] = diff[ diff>0 ]
+    
+    # down change is equal to negative deifference, otherwise equal to zero
+    down_chg[diff < 0] = diff[ diff < 0 ]
+    
+    # check pandas documentation for ewm
+    # https://pandas.pydata.org/pandas-docs/stable/reference/api/pandas.DataFrame.ewm.html
+    # values are related to exponential decay
+    # we set com=time_window-1 so we get decay alpha=1/time_window
+    up_chg_avg   = up_chg.ewm(com=time_window-1 , min_periods=time_window).mean()
+    down_chg_avg = down_chg.ewm(com=time_window-1 , min_periods=time_window).mean()
+    
+    rs = abs(up_chg_avg/down_chg_avg)
+    rsi = 100 - 100/(1+rs)
+    return rsi
+
+RSI=computeRSI(data_graph['close'],5)
+
+
+def BuySignal(percentB,price,MavDiff, RSI):
+    buy_signal = []
+    for i in range(0,len(percentB)):
+        if percentB[i]<0 and percentB[i-1] > -0.2 and MavDiff[i]<0 and RSI[i]<=30:
+            buy_signal.append(price[i])
+        else:
+            buy_signal.append(np.nan)
+    return buy_signal
+
+buys=BuySignal(data_graph['percentB'], data_graph['close'],mav_diff,RSI)
+
+def SellSignal(percentB,price,MavDiff, RSI):
+    sell_signal = []
+    for i in range(0,len(percentB)):
+        if percentB[i]>1 and percentB[i-1] >= 1 and MavDiff[i]>0 and RSI[i]>=80:
+            sell_signal.append(price[i])
+        else:
+            sell_signal.append(np.nan)
+    return sell_signal
+
+sells=SellSignal(data_graph['percentB'], data_graph['close'],mav_diff,RSI)
+
+plots = [mpf.make_addplot(bands,color='orange',linestyle='dashdot'),
+         mpf.make_addplot(mav1,color='blue'),
+         mpf.make_addplot(mav2,color='skyblue'),
+         mpf.make_addplot(buys,type='scatter',markersize=50,marker='o',color='green'),
+         mpf.make_addplot(sells,type='scatter',markersize=50,marker='x',color='red'),
+         mpf.make_addplot(mav_diff,panel=1,color='g',type='bar', width=0.75),
+         mpf.make_addplot(RSI,panel=1,color='r', width=0.75)
+       ]
+
+mpf.plot(data_graph,type='candle',addplot=plots,figsize=(10,6),title=str(asset)+str(interval)+'min',style='yahoo')
